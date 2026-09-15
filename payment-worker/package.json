@@ -1,0 +1,22 @@
+{
+  "name": "cc-pay-payment-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated official Alipay checkout for the cc-pay Rust library",
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "1.62.1",
+    "proxy-chain": "3.0.1"
+  },
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "node worker.ts --self-test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.3"
+  }
+}
