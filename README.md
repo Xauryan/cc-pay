@@ -4,32 +4,32 @@
 
 [简体中文](README.md) · [English](README.en.md)
 
-从已有校园付订单和认证会话出发，处理微信、支付宝、数字人民币支付及订单查询。
-本项目的核心是库接口：不提供 CLI 或常驻服务，不接管宿主项目的配置、日志、运行时和部署。
+cc-pay 提供微信扫码、支付宝扫码与密码付款、数字人民币钱包付款及订单查询接口。调用方传入已有校园付订单和认证会话，在宿主应用中配置运行时、代理、存储和结果展示。
 
-## 包与职责
+## 包与功能
 
-| 包 | 能力 | 依赖边界 |
+| 包 | 功能 | 接入方式 |
 | --- | --- | --- |
-| `cc-pay` | 会话、HTTP API、扫码、数字人民币、防重和结果核对 | 不依赖 Playwright、Node 或脚本文件 |
-| `cc-pay-playwright` | 实现 `PasswordPayer`，可选支付宝密码付款 | Rust Playwright binding；调用方传入 `Browser` |
+| `cc-pay` | 会话、HTTP API、二维码、数字人民币、防重和结果核对 | 构建 `Client`，传入会话及付款参数 |
+| `cc-pay-playwright` | 支付宝密码付款 | 传入已有 `Browser`，通过 `PasswordPayer` 接入客户端 |
 
-只引用 `cc-pay` 不会构建浏览器适配库。项目不包含商户下单、商户签名生成、机构账号登录、CLI 参数解析或环境变量加载。
+`cc-pay` 可独立引用。支付宝密码付款适配器的配置和运行要求见 [cc-pay-playwright](crates/cc-pay-playwright/README.md)。
 
 ## 引用
 
-尚未发布到 crates.io，使用 Git 依赖；生产集成建议固定 `rev`：
+使用支持 Rust 2024 edition 的工具链，通过 Git 引用：
 
 ```toml
 [dependencies]
 cc-pay = { git = "https://github.com/Xauryan/cc-pay" }
+anyhow = "1"
 ```
 
-Cargo 包名是 `cc-pay`，Rust 导入名是 `cc_pay`。使用支持 Rust 2024 的工具链；可选 Playwright 适配库所用 binding 要求 Rust 1.88 或更高版本。
+Cargo 包名为 `cc-pay`，Rust 导入名为 `cc_pay`。生产集成可通过 Git 依赖的 `rev` 固定提交。异步请求在宿主提供的 Tokio 运行时中执行。
 
-## 在宿主项目中调用
+## 创建扫码付款
 
-示例由调用方传入订单、会话和金额，不要求约定的环境变量、当前工作目录或可执行程序入口。
+以下示例接收收银台 URL、Cookie 请求头和预期金额，在宿主的 Tokio 运行时中调用：
 
 ```rust,no_run
 use cc_pay::{Client, Payment, PaymentMethod, PaymentOptions};
@@ -50,13 +50,24 @@ pub async fn wechat_payment(
 }
 ```
 
-`qr_png` 是 Base64 编码的 PNG，由宿主决定如何展示。支付宝扫码使用 `PaymentMethod::Alipay` 且不传密码。
-`transaction` 查询校园付订单，`payment_ways` 查询可用支付渠道。
+`Payment.qr_png` 是 Base64 编码的 PNG，宿主可将其转换为 `data:image/png;base64,...` 展示。支付宝扫码使用 `PaymentMethod::Alipay`，并保持 `PaymentOptions.alipay` 为 `None`。
 
-## 会话和 HTTP 传输
+## 客户端与会话
 
-`cookie_header` 接受 `name=value; other=value` 格式。使用 `cookie_jar` 共享现有 `Arc<CookieJar>`。
-通过 `sso_origin` 显式允许 CAS origin，再调用 `authenticate` 复用已有 SSO 会话；本库不处理交互登录。
+`Client::builder()` 使用内置 `HttpTransport`。`ClientBuilder<P>` 和 `PaymentClient<P>` 的类型参数 `P` 表示密码付款适配器，默认值为 `NoPasswordPayer`。
+
+| 配置方法 | 用途 |
+| --- | --- |
+| `cookie_jar(jar)` | 共享宿主的 `Arc<CookieJar>` |
+| `cookie_header(origin, header)` | 为指定 origin 写入 `name=value; other=value` 格式的 Cookie |
+| `sso_origin(origin)` | 允许一个 CAS SSO origin |
+| `proxy(url)` | 设置 HTTP 传输使用的代理 |
+| `user_agent(value)` | 设置 HTTP User-Agent |
+| `attempt_store(store)` | 注入 `Arc<dyn AttemptStore>` |
+| `state_directory(path)` | 使用指定本地目录保存付款防重记录 |
+| `password_payer(payer)` | 注入实现 `PasswordPayer` 的付款适配器 |
+
+Cookie origin 和 SSO origin 使用 HTTPS 443，路径为 `/`，查询参数和 fragment 为空。宿主提供已认证会话；`authenticate(cashier_url, sso_login_url)` 复用该会话完成校园付 SSO 跳转。
 
 ```rust,no_run
 use cc_pay::{Client, CookieJar, PaymentClient};
@@ -71,13 +82,13 @@ pub fn payment_client(jar: Arc<CookieJar>, proxy: &str) -> anyhow::Result<Paymen
 }
 ```
 
-内置 `HttpTransport` 支持 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理及认证，不继承系统代理、不在失败时直连。
-它限制请求目标为获准的 HTTPS 443 地址，限制响应大小，并禁用透明重试和自动重定向。
-`Client::new(custom_transport)` 可接入宿主 HTTP 实现；自定义实现须遵守 `Transport` 的 Cookie、目标校验和禁止重放约定。
+`HttpTransport` 支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理及认证。代理由 `proxy` 显式配置，代理请求失败时返回错误。内置传输的连接超时为 5 秒、请求超时为 15 秒、响应体上限为 8 MiB；请求目标限定在授权的 HTTPS 443 地址内。自动重试和自动重定向处于禁用状态，支付流程逐次验证并跟随跳转。
 
-## 自动付款与防重
+HTTP 客户端和浏览器各自配置代理，宿主负责保持两者的出口策略一致。
 
-**自动付款必须显式配置 `AttemptStore`。** 默认客户端可查询和生成扫码入口，不创建目录；没有存储时，支付宝密码付款和数字人民币付款会在任何网络请求前返回错误。
+## 自动付款与防重存储
+
+**支付宝密码付款和数字人民币付款必须显式配置 `AttemptStore`。** 缺少存储时，`create_payment` 在发起网络请求前返回错误。查询和扫码付款可使用默认客户端。
 
 ```rust,no_run
 use cc_pay::{AttemptStore, Client, PaymentClient};
@@ -88,46 +99,66 @@ pub fn with_shared_store(store: Arc<dyn AttemptStore>) -> anyhow::Result<Payment
 }
 ```
 
-- 多台服务器：实现 `AttemptStore`，用数据库唯一约束原子持久化订单 claim。
-- 本地持久化：显式调用 `.state_directory(application_owned_path)`，使用 `FileAttemptStore`。
-- 测试或明确接受进程内保护：显式注入 `MemoryAttemptStore`；它不跨重启保留记录。
+| 存储方式 | 适用场景 | 行为 |
+| --- | --- | --- |
+| 自定义 `AttemptStore` | 多台应用服务器 | 通过共享存储和唯一约束，原子持久化订单占用记录 |
+| `FileAttemptStore` / `state_directory(path)` | 使用同一本地目录的应用进程 | 通过原子文件创建保存记录，重启后继续生效 |
+| `MemoryAttemptStore` | 测试或进程内保护 | 记录保存在所共享的存储实例中，生命周期随进程结束 |
 
-同一订单的自动付款 claim 不会自动释放。查询错误、取消任务或结果未知都不能成为重新扣款的理由。
-传入 `PaymentOptions.expected_amount` 按十进制定点校验金额；请勿在业务层用浮点四舍五入代替金额核对。
+`AttemptStore::contains` 查询记录，`claim` 为每个订单最多返回一次 `true`。持久化实现应在 `claim` 返回成功前完成落盘。`attempt_store` 和 `state_directory` 以最后一次配置为准；本地目录在 `build()` 时创建。
 
-数字人民币使用 `PaymentMethod::Ecny`，先在官方 App 绑定商户子钱包。`ecny_wallet_index = 0` 按上游顺序单轮尝试；`1..=99` 只尝试对应钱包。只有明确拒绝且核实订单仍未支付才会换钱包；超时或未知结果立即停止。
+自动付款占用记录按订单保存，并用于阻止该订单后续的付款创建请求，覆盖各支付方式。记录持续保留；查询错误、任务取消或结果未知时，后续操作应限于订单查询和付款核对。应用重启和多实例运行期间应持续使用同一组防重记录。
 
-## 可选支付宝密码付款
+`PaymentOptions.expected_amount` 接受十进制金额字符串，金额比较使用整数分计算。自动扣款前会校验预期金额；金额不符时停止扣款。
 
-额外引用 `cc-pay-playwright`，把宿主已有的 `playwright_rs::Browser` 传入 `PlaywrightPayer::new(browser)`，通过 `.password_payer(payer)` 注入客户端。完整可编译示例、运行时和代理边界见 [适配库文档](crates/cc-pay-playwright/README.md)。
+## 数字人民币
 
-核心库只认识 `PasswordPayer` 和 `PasswordPayment`。宿主可以实现自己的适配器，无需安装 Playwright。
-适配器只能返回未提交、明确拒绝或结果待确认；最终成功必须由校园付订单确认。
+先在数字人民币 App 绑定商户子钱包，再使用 `PaymentMethod::Ecny`。`PaymentOptions.ecny_wallet_index` 控制钱包选择：
 
-Playwright 的 Rust binding 底层仍使用 Node.js driver。项目移除了自有 TypeScript worker、stdin/stdout JSON 协议、`CC_PAY_NODE` / `CC_PAY_WORKER` / `CC_PAY_BROWSER` 配置和编译期脚本路径。可选适配库使用支持请求拦截的 `playwright-rs 0.18.1`；不在付款调用中安装或启动 driver / 浏览器。
+| 值 | 行为 |
+| --- | --- |
+| `0`，默认值 | 按 `payment_ways` 返回的 `ecCode` 顺序，每个钱包尝试一次 |
+| `1..=99` | 仅尝试对应序号的钱包；序号超出已绑定钱包数量时停止付款准备 |
+
+钱包切换要求上游明确拒绝，并确认同一订单仍处于待支付状态。超时或未知结果会停止后续尝试。付款成功以校园付订单状态为准。
+
+## 支付宝密码付款
+
+引用 `cc-pay-playwright`，将宿主已有的 `playwright_rs::Browser` 传给 `PlaywrightPayer::new(browser)`，再通过 `password_payer` 注入客户端。调用 `create_payment` 时，将支付宝账号和六位支付密码作为 `AlipayCredentials` 放入 `PaymentOptions.alipay`。
+
+适配库使用 `playwright-rs 0.18.1`，运行环境包含 Playwright driver、Node.js 和 Chromium。宿主负责运行环境准备、浏览器启动、代理、日志及关闭。完整示例与配置要求见 [适配库文档](crates/cc-pay-playwright/README.md)。
 
 ## 结果处理
+
+`create_payment` 返回 `Payment`，其中包含付款方式、订单状态、金额、二维码及自动付款结果。
 
 | 结果 | 调用方处理 |
 | --- | --- |
 | `status == "success"` | 校园付已确认付款 |
-| `needs_confirmation()` | 只查询 `transaction`，必要时人工核对 |
+| `needs_confirmation()` 返回 `true` | 查询 `transaction`，必要时人工核对 |
 | `qr_png` 存在 | 展示二维码并查询订单状态 |
-| `automatic.outcome == "rejected"` | 明确失败；如返回二维码则可展示 |
-| 错误或其他状态 | 查询、核对，避免盲目重试 |
+| `automatic.outcome == "rejected"` | 自动付款明确失败；如返回二维码则可展示 |
+| 错误或其他状态 | 查询订单并核对结果后处理 |
 
-不记录密码、Cookie、签名 URL 或上游原始响应；宿主也应避免对这些值启用日志、浏览器 trace 或 HAR。
+`automatic.debit_submitted` 记录扣款请求是否已提交，`password_submitted` 记录密码请求是否已提交。宿主的日志、浏览器 trace 和 HAR 应排除密码、Cookie、签名 URL 及上游原始响应。
 
-## 从 0.2 迁移
+## 查询与扩展接口
 
-此次是 0.3 API 边界调整：
+`transaction(cashier_url)` 查询订单，`payment_ways(cashier_url)` 查询可用支付渠道。两者均返回 `serde_json::Value`，便于调用方读取上游字段。
 
-1. 移除 `BrowserPayer` / `BrowserResult` / `.alipay_browser(...)`，改用 `cc_pay_playwright::PlaywrightPayer` 或自定义 `PasswordPayer`；返回 `PasswordPayment`。
-2. `ClientBuilder<P>` 和 `PaymentClient<P>` 保留注入的付款适配器类型，默认 `NoPasswordPayer`。
-3. 默认不再写 `.cc-pay/attempts`，**继续显式使用旧目录或原有共享存储**；迁移时不得清空防重记录。
-4. `.proxy(...)` 只配置 HTTP。宿主负责给浏览器配置相同出口；认证 SOCKS 代理需要宿主提供 relay。删除原 worker 部署步骤。
+| 接口 | 契约 |
+| --- | --- |
+| `Transport` | 共享 Cookie、校验目标地址、限制响应大小，并禁用自动重试和重定向 |
+| `AttemptStore` | 查询并原子记录订单的自动付款尝试，存储错误会阻止付款 |
+| `PasswordPayer` | 接收签名表单、金额和凭据，返回 `PasswordPayment` |
+
+`Client::new(transport)` 接入自定义传输，`Client::with_password_payer(transport, payer)` 同时接入自定义付款适配器。通过 `with_attempt_store(store)` 配置防重存储。`PasswordPayer` 支持 `Arc<P>` 和 `Option<P>` 包装。
+
+`PasswordPayment` 提供 `not_submitted`、`rejected` 和 `uncertain` 构造方法，以及状态、原因和提交标记的读取方法。扣款可能已提交时应返回 `uncertain`；校园付订单状态负责确认最终成功。
 
 ## 开发验证
+
+在仓库根目录执行：
 
 ```sh
 cargo test --locked -p cc-pay
@@ -136,4 +167,4 @@ PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD=1 cargo clippy --locked --workspace --all-target
 cargo fmt --all -- --check
 ```
 
-常规测试覆盖模拟 API、付款状态、防重及路由策略，不发起真实付款。可选本地浏览器测试使用内存页面和模拟路由，见适配库文档。测试通过不代表支付宝或数字人民币的真实扣款验收。
+常规测试使用模拟 API，覆盖付款状态、防重、金额校验及路由策略。文档中的 Rust 示例参与编译检查。本地浏览器测试使用内存页面和模拟响应，运行方式见适配库文档。真实账户及支付渠道的验收由宿主集成环境单独执行。
