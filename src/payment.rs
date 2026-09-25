@@ -18,11 +18,7 @@ pub fn parse_post_form(html: &str) -> Result<(String, Fields)> {
 
 const CASHIER: &str = "https://cashier.cc-pay.cn";
 fn data(v: Value) -> Result<Value> {
-    ensure!(
-        v["success"] == true,
-        "校园付拒绝请求：{}",
-        val(&v, "message")
-    );
+    ensure!(v["success"] == true, "校园付拒绝请求");
     v.get("data").cloned().context("校园付响应缺少 data")
 }
 fn scalar(v: &Value, key: &str) -> Result<String> {
@@ -198,9 +194,17 @@ impl<T: Transport, P: PasswordPayer> Client<T, P> {
         let method = method.as_str();
         let id = cashier_id(cashier)?;
         ensure!(
-            !self.attempts.contains(&id)?,
+            !self
+                .attempts
+                .as_ref()
+                .map(|store| store.contains(&id))
+                .transpose()?
+                .unwrap_or(false),
             "该订单已有自动付款尝试，请仅查询付款状态"
         );
+        if method == "ecny" || (method == "alipay" && options.alipay.is_some()) {
+            ensure!(self.attempts.is_some(), "自动付款必须显式配置 AttemptStore");
+        }
         if method == "ecny" {
             return self
                 .ecny_payment(cashier, options.ecny_wallet_index, options.expected_amount)
@@ -247,10 +251,10 @@ impl<T: Transport, P: PasswordPayer> Client<T, P> {
                 .pay(&action, &values, &payment.amount, options.alipay.unwrap())
                 .await;
             payment.account_attempt = Some(result.message().into());
-            payment.password_submitted = result.password_submitted;
+            payment.password_submitted = result.password_submitted();
             payment.automatic = Some(AutomaticPayment {
-                outcome: result.outcome,
-                debit_submitted: result.debit_submitted,
+                outcome: result.outcome().as_str().into(),
+                debit_submitted: result.debit_submitted(),
             });
             // Campus transaction state is authoritative; allow its callback time to arrive.
             // A stale wait_payer_pay after a submitted debit is not proof of failure.
@@ -385,6 +389,12 @@ pub fn cashier_id(cashier: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upstream_rejection_does_not_expose_provider_message() {
+        let error = data(json!({"success": false, "message": "account=private; session=secret"}))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "校园付拒绝请求");
+    }
     #[test]
     fn unfamiliar_transaction_states_keep_submitted_payments_protected() {
         let mut payment: Payment =

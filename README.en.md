@@ -1,190 +1,153 @@
 # cc-pay
 
-**A Rust API library for campus payments · WeChat, Alipay and e-CNY**
+**A campus-payment API library for other Rust projects to import and reference.**
 
 [简体中文](README.md) · [English](README.en.md)
 
-![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust)
-![Tokio](https://img.shields.io/badge/Async-Tokio-463D5E)
-![Reqwest](https://img.shields.io/badge/HTTP-Reqwest%20%2B%20Rustls-009688)
-![Serde](https://img.shields.io/badge/JSON-Serde-E57324)
-![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
-![Playwright](https://img.shields.io/badge/Browser-Playwright-2EAD33)
-![Node.js](https://img.shields.io/badge/Node.js-%3E%3D24.12-5FA04E?logo=nodedotjs&logoColor=white)
+The library starts with an existing campus cashier order and authenticated session.
+It supports WeChat, Alipay, e-CNY and transaction queries. The consuming application
+owns configuration, logging, runtime and deployment. This repository provides no
+CLI or standalone service.
 
-Starting with an existing campus cashier order and authenticated session, cc-pay handles payment channels, QR codes, proxies and payment status. Embed it in a Rust service or supply your own HTTP client and attempt store through traits.
+## Packages
 
-## Features
-
-| Method | Capabilities | Runtime |
+| Package | Responsibility | Boundary |
 | --- | --- | --- |
-| WeChat | QR code generation and order queries | Rust |
-| Alipay | QR payments; optional password payments with QR fallback | Rust; Node.js + Chromium for password payments |
-| e-CNY | Bound sub-wallet payments; one selected wallet or a single ordered pass | Rust |
+| `cc-pay` | Sessions, HTTP APIs, QR payments, e-CNY, attempt claims and reconciliation | No Playwright, Node or script dependency |
+| `cc-pay-playwright` | Optional Rust implementation of `PasswordPayer` | Application supplies a running `Browser` |
 
-- Cookie session reuse and authentication through an existing CAS SSO session.
-- HTTP / HTTPS / SOCKS5 / SOCKS5H proxies, including credentials and private networks.
-- Exact decimal amount checks, persistent duplicate-payment protection and uncertain-outcome handling.
-- Isolated Alipay browser contexts, with credentials passed through stdin.
+Importing `cc-pay` does not build the browser adapter. Merchant order creation,
+signing and institutional interactive login are outside the library's scope.
 
-The library does not create merchant orders, generate merchant signatures or log in to institutional accounts. Automatic Alipay payments depend on the official security component, account status and any additional verification requirements.
+## Dependency and integration
 
-## Installation
-
-Use a stable toolchain supporting Rust 2024 edition. The package is available through Git and is not yet published to crates.io:
+The packages are not published to crates.io. Use a Git dependency and pin `rev`
+for production integrations:
 
 ```toml
 [dependencies]
 cc-pay = { git = "https://github.com/Xauryan/cc-pay" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-anyhow = "1"
 ```
 
-The Cargo package name is `cc-pay`; the Rust import name is `cc_pay`. Pin a Git commit with `rev` in production.
-
-## Quick start
+The Rust import is `cc_pay`. Use a Rust 2024 toolchain; the optional Playwright
+binding requires Rust 1.88 or newer.
 
 ```rust,no_run
-use cc_pay::{Client, PaymentMethod, PaymentOptions};
+use cc_pay::{Client, Payment, PaymentMethod, PaymentOptions};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cashier = std::env::var("CC_PAY_CASHIER_URL")?;
-    let cookie = std::env::var("CC_PAY_COOKIE")?;
+pub async fn prepare_payment(
+    cashier_url: &str,
+    cookie_header: &str,
+    expected_amount: &str,
+) -> anyhow::Result<Payment> {
     let client = Client::builder()
-        .cookie_header("https://cashier.cc-pay.cn", cookie)
-        .state_directory("./.cc-pay/attempts")
+        .cookie_header("https://cashier.cc-pay.cn", cookie_header)
         .build()?;
-
-    let transaction = client.transaction(&cashier).await?;
-    println!("status={}", transaction["status"]);
-
-    let payment = client.create_payment(
-        &cashier,
-        PaymentMethod::Wechat,
-        PaymentOptions {
-            expected_amount: Some("1.00"),
-            ..Default::default()
-        },
-    ).await?;
-
-    // qr_png contains a Base64-encoded PNG for your application to display.
-    if let Some(png) = payment.qr_png {
-        let _image_source = format!("data:image/png;base64,{png}");
-    }
-    Ok(())
+    client.create_payment(cashier_url, PaymentMethod::Wechat, PaymentOptions {
+        expected_amount: Some(expected_amount),
+        ..Default::default()
+    }).await
 }
 ```
 
-Use `PaymentMethod::Alipay` for an Alipay QR payment. The caller reads the environment variables in these examples; the library does not load `.env`. Cookie headers use `name=value; other=value` syntax. Use `cookie_jar` to share an existing `Arc<CookieJar>`.
+`qr_png` contains a Base64 PNG for the host to display. Select
+`PaymentMethod::Alipay` without credentials for Alipay QR payments. Use
+`transaction` and `payment_ways` to query order state and available channels.
+These examples accept application parameters; no environment variables, working
+directory convention or executable entry point are required.
 
-## Alipay password payments
+## Sessions and transport
 
-Install the optional component only when using password payments. With **Node.js ≥ 24.12** and pnpm installed, run from the repository or extracted `.crate` directory:
+`cookie_header` accepts `name=value; other=value`. `cookie_jar` shares an existing
+`Arc<CookieJar>`. Explicitly allow a CAS origin with `sso_origin` before calling
+`authenticate` to reuse an existing SSO session.
 
-```sh
-cd payment-worker
-pnpm install --frozen-lockfile
-pnpm exec playwright-core install chromium --only-shell
-pnpm check
-```
+`HttpTransport` supports authenticated HTTP, HTTPS, SOCKS5 and SOCKS5H proxies,
+including private networks. It never inherits system proxy variables or retries
+directly. It restricts requests to approved HTTPS port 443 destinations, bounds
+responses and disables automatic retries/redirects. `Client::new(transport)`
+accepts custom implementations respecting the `Transport` contract.
 
-Add `--with-deps` to the browser installation command if Linux system dependencies are missing. The worker uses [Node.js native TypeScript support](https://nodejs.org/api/typescript.html) and does not require generated JavaScript files. `pnpm check` only probes local browser startup; it does not initiate a payment.
+## Explicit automatic-payment storage
 
-```rust,no_run
-use cc_pay::{AlipayCredentials, BrowserPayer, Client, PaymentMethod, PaymentOptions};
-
-# async fn example() -> anyhow::Result<()> {
-let client = Client::builder()
-    .cookie_header("https://cashier.cc-pay.cn", std::env::var("CC_PAY_COOKIE")?)
-    .alipay_browser(BrowserPayer::default())
-    .build()?;
-let cashier = std::env::var("CC_PAY_CASHIER_URL")?;
-let account = std::env::var("CC_PAY_ALIPAY_ACCOUNT")?;
-let password = std::env::var("CC_PAY_ALIPAY_PASSWORD")?;
-let payment = client.create_payment(&cashier, PaymentMethod::Alipay, PaymentOptions {
-    alipay: Some(AlipayCredentials { account: &account, password: &password }),
-    expected_amount: Some("1.00"),
-    ..Default::default()
-}).await?;
-# Ok(())
-# }
-```
-
-| Worker environment variable | Purpose |
-| --- | --- |
-| `CC_PAY_NODE` | Node.js executable; defaults to `node` |
-| `CC_PAY_WORKER` | Absolute path to `worker.ts`; defaults to the package directory at compile time |
-| `CC_PAY_BROWSER` | Existing Chromium executable; allows skipping the browser download |
-
-When deploying a binary, also deploy `payment-worker` with its dependencies and set `CC_PAY_WORKER`. Without Alipay credentials, the library uses QR payments. Explicit rejection or a pre-submission failure can fall back to QR after checking the order. Submitted or uncertain payments only trigger status queries.
-
-## e-CNY
-
-First bind the merchant sub-wallet in the e-CNY app. Select `PaymentMethod::Ecny` and set `PaymentOptions.ecny_wallet_index`:
-
-- `0`: try each wallet at most once, in the `ecCode` order returned by `payment_ways`.
-- `1..=99`: try only that wallet index; stop before debit if it does not exist.
-
-Wallets change only after an explicit rejection and confirmation that the order remains unpaid. Timeouts and uncertain outcomes stop the sequence. The campus order confirms success; e-CNY payments do not produce QR codes.
-
-## Sessions and proxies
+The default client does not create a directory. **Automatic Alipay and e-CNY
+payments require an explicitly configured `AttemptStore`**, checked before any
+network request:
 
 ```rust,no_run
-use cc_pay::Client;
+use cc_pay::{AttemptStore, Client, PaymentClient};
+use std::sync::Arc;
 
-# async fn example() -> anyhow::Result<()> {
-let client = Client::builder()
-    .proxy("socks5h://user:password@127.0.0.1:1080")
-    .sso_origin("https://sso.example.org")
-    .cookie_header("https://sso.example.org", "SESSION=existing-session")
-    .build()?;
-let cashier = std::env::var("CC_PAY_CASHIER_URL")?;
-client.authenticate(&cashier, "https://sso.example.org/login").await?;
-# Ok(())
-# }
+pub fn shared_client(store: Arc<dyn AttemptStore>) -> anyhow::Result<PaymentClient> {
+    Client::builder().attempt_store(store).build()
+}
 ```
 
-The proxy applies to both Rust requests and the Alipay browser, with no direct fallback on failure. Requests are restricted to approved HTTPS origins on port 443. Transparent retries and automatic redirects are disabled; the payment flow follows only validated redirects.
+Implement `AttemptStore` with an atomic persistent unique key for multiple hosts.
+Opt into local storage with `.state_directory(application_owned_path)` or
+`FileAttemptStore`. Explicitly inject `MemoryAttemptStore` only when process-local
+protection is appropriate; it does not survive restarts.
 
-## Payment results and duplicate protection
+Claims are never automatically released. Cancellation, errors and uncertain
+outcomes must not cause another debit. `PaymentOptions.expected_amount` checks
+exact decimal values before automatic debit.
 
-| Result | Caller action |
+For e-CNY, first bind the merchant sub-wallet in the official app. Select
+`PaymentMethod::Ecny`. `ecny_wallet_index = 0` tries each upstream wallet once in
+order; `1..=99` selects only that wallet. Rotation requires explicit rejection
+and confirmation that the same order remains unpaid. Uncertainty stops the flow.
+
+## Optional Alipay password adapter
+
+Import `cc-pay-playwright`, pass an application-owned `playwright_rs::Browser` to
+`PlaywrightPayer::new(browser)` and inject it through `.password_payer(payer)`.
+See the [adapter README](crates/cc-pay-playwright/README.md) for a compiling
+integration example and runtime/proxy responsibilities.
+
+The core depends only on `PasswordPayer` and `PasswordPayment`, so other adapters
+need no Playwright installation. Adapter results distinguish not submitted,
+explicitly rejected and uncertain. Only campus transaction state confirms success.
+
+Rust Playwright bindings still use a Node.js driver internally. This project no
+longer contains a TypeScript worker, stdin/stdout protocol, compile-time script
+path, or `CC_PAY_NODE` / `CC_PAY_WORKER` / `CC_PAY_BROWSER` settings. The optional
+adapter uses `playwright-rs 0.18.1` for request interception. It does not install
+or launch a driver/browser during payment calls.
+
+## Result handling
+
+| Result | Application action |
 | --- | --- |
-| `status == "success"` | Campus cashier has confirmed payment |
-| `needs_confirmation() == true` | Only query `transaction`; reconcile manually if necessary |
-| `qr_png` is present | Display the QR code, then query the order |
-| `automatic.outcome == "rejected"` | Automatic payment was explicitly rejected; display the QR code if present |
-| Other states or errors | Query the order or handle manually; avoid blind retries |
+| `status == "success"` | Campus cashier confirmed payment |
+| `needs_confirmation()` | Query `transaction`; reconcile if needed |
+| `qr_png` is present | Display it and query order status |
+| `automatic.outcome == "rejected"` | Explicit rejection; display QR if present |
+| Error or another state | Query and reconcile; avoid blind retries |
 
-`Client::builder()` stores automatic-payment claims in `.cc-pay/attempts` by default. Each order can start only one automatic-payment attempt; claims are never automatically released. Processes must share the same local directory. Multiple servers should implement `AttemptStore` using shared storage with a unique constraint. The advanced `Client::new` constructor uses an in-memory store and requires explicit persistence configuration.
+Never log passwords, cookies, signed URLs or raw provider responses. Host browser
+trace, HAR and debug logs can also disclose secrets.
 
-**When migrating from an earlier version**, update the package name, imports and worker environment variables. Keep using the existing attempt directory through `state_directory`, or migrate its records while the application is stopped. Never clear claims to retry an unconfirmed payment. Do not log passwords, cookies, signed URLs or raw payment responses.
+## Migration from 0.2
 
-## API overview
+1. Replace `BrowserPayer`, `BrowserResult` and `.alipay_browser(...)` with
+   `PlaywrightPayer` or a custom `PasswordPayer`, returning `PasswordPayment`.
+2. `ClientBuilder<P>` and `PaymentClient<P>` preserve the injected payer type;
+   the default is `NoPasswordPayer`.
+3. Default `.cc-pay/attempts` writes are removed. **Explicitly retain the existing
+   directory or shared store**; never clear claims during migration.
+4. `.proxy(...)` configures HTTP only. Configure the same browser exit in the
+   host; authenticated SOCKS requires an application-owned relay. Remove worker
+   deployment steps.
 
-| Interface | Purpose |
-| --- | --- |
-| `Client::builder()` / `PaymentClient` | Default client, sessions, proxies and persistent claims |
-| `transaction` / `payment_ways` | Query orders and available channels |
-| `authenticate` | Authenticate with an existing CAS SSO session |
-| `create_payment` | Create a QR payment or initiate an automatic payment |
-| `BrowserPayer` / `PasswordPayer` | Built-in Alipay worker or custom implementation |
-| `Transport` / `AttemptStore` | Custom HTTP transport and shared attempt storage |
-
-## Layout and verification
-
-```text
-src/              Rust API, payment flows, sessions and attempt storage
-payment-worker/   Optional TypeScript Alipay password-payment worker
-README.md         Chinese documentation
-README.en.md      English documentation
-```
+## Validation
 
 ```sh
-cargo test --locked
-pnpm --dir payment-worker typecheck
-pnpm --dir payment-worker check
+cargo test --locked -p cc-pay
+PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD=1 cargo test --locked --workspace
+PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD=1 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-Inline unit tests cover core behavior, and Rust documentation examples are checked by the compiler. There are no standalone demo programs or platform-specific installation scripts.
+Default tests use simulated APIs and routing policies without real payments.
+Optional local browser tests use in-memory pages and fulfilled routes; see the
+adapter README. Passing tests does not establish real provider acceptance.

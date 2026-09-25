@@ -1,21 +1,24 @@
-use crate::{AttemptStore, BrowserPayer, Client, CookieJar, FileAttemptStore, HttpTransport};
+use crate::{
+    AttemptStore, Client, CookieJar, FileAttemptStore, HttpTransport, NoPasswordPayer,
+    PasswordPayer,
+};
 use anyhow::{Result, ensure};
 use std::{path::PathBuf, sync::Arc};
 
 /// Ready-to-use client returned by `Client::builder()`.
-pub type PaymentClient = Client<HttpTransport, Option<BrowserPayer>>;
+pub type PaymentClient<P = NoPasswordPayer> = Client<HttpTransport, P>;
 
-pub struct ClientBuilder {
+pub struct ClientBuilder<P = NoPasswordPayer> {
     jar: Arc<CookieJar>,
     proxy: Option<String>,
     user_agent: String,
     sso_origins: Vec<String>,
     cookies: Vec<(String, String)>,
-    browser: Option<BrowserPayer>,
-    state_directory: PathBuf,
+    payer: P,
+    state_directory: Option<PathBuf>,
     store: Option<Arc<dyn AttemptStore>>,
 }
-impl Default for ClientBuilder {
+impl Default for ClientBuilder<NoPasswordPayer> {
     fn default() -> Self {
         Self {
             jar: Arc::new(CookieJar::default()),
@@ -23,8 +26,8 @@ impl Default for ClientBuilder {
             user_agent: format!("cc-pay/{}", env!("CARGO_PKG_VERSION")),
             sso_origins: Vec::new(),
             cookies: Vec::new(),
-            browser: None,
-            state_directory: ".cc-pay/attempts".into(),
+            payer: NoPasswordPayer,
+            state_directory: None,
             store: None,
         }
     }
@@ -34,7 +37,7 @@ impl Client {
         ClientBuilder::default()
     }
 }
-impl ClientBuilder {
+impl<P: PasswordPayer> ClientBuilder<P> {
     pub fn cookie_jar(mut self, jar: Arc<CookieJar>) -> Self {
         self.jar = jar;
         self
@@ -57,21 +60,32 @@ impl ClientBuilder {
         self.sso_origins.push(origin.into());
         self
     }
-    /// Enable the optional official Alipay browser component. The builder uses
-    /// the same proxy for protocol requests and the browser, overriding payer.proxy.
-    pub fn alipay_browser(mut self, payer: BrowserPayer) -> Self {
-        self.browser = Some(payer);
-        self
+    /// Inject an application-owned payer. Its runtime and proxy configuration are
+    /// independent of this HTTP client's configuration.
+    pub fn password_payer<Q: PasswordPayer>(self, payer: Q) -> ClientBuilder<Q> {
+        ClientBuilder {
+            jar: self.jar,
+            proxy: self.proxy,
+            user_agent: self.user_agent,
+            sso_origins: self.sso_origins,
+            cookies: self.cookies,
+            payer,
+            state_directory: self.state_directory,
+            store: self.store,
+        }
     }
+    /// Explicit opt-in to durable local storage. Reuse existing claims on migration.
     pub fn state_directory(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.state_directory = directory.into();
+        self.state_directory = Some(directory.into());
+        self.store = None;
         self
     }
     pub fn attempt_store(mut self, store: Arc<dyn AttemptStore>) -> Self {
         self.store = Some(store);
+        self.state_directory = None;
         self
     }
-    pub fn build(mut self) -> Result<PaymentClient> {
+    pub fn build(self) -> Result<PaymentClient<P>> {
         let transport = HttpTransport::new(
             self.jar.clone(),
             self.proxy.as_deref(),
@@ -82,6 +96,7 @@ impl ClientBuilder {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
         )?;
+        let mut validated_cookies = Vec::new();
         for (origin, header) in self.cookies {
             let origin = transport.validate(&origin)?;
             ensure!(
@@ -108,18 +123,22 @@ impl ClientBuilder {
                             .all(|b| (0x21..=0x7e).contains(&b) && !b"\";,\\".contains(&b)),
                     "Cookie 请求头无效"
                 );
-                self.jar
-                    .add_cookie_str(&format!("{name}={value}; Path=/; Secure"), &origin);
+                validated_cookies.push((origin.clone(), format!("{name}={value}; Path=/; Secure")));
             }
         }
-        if let Some(browser) = self.browser.as_mut() {
-            browser.proxy = self.proxy.clone();
-        }
-        let store = match self.store {
-            Some(store) => store,
-            None => Arc::new(FileAttemptStore::new(self.state_directory)?),
+        let store = match (self.store, self.state_directory) {
+            (Some(store), _) => Some(store),
+            (_, Some(directory)) => {
+                Some(Arc::new(FileAttemptStore::new(directory)?) as Arc<dyn AttemptStore>)
+            }
+            _ => None,
         };
-        Ok(Client::with_password_payer(transport, self.browser).with_attempt_store(store))
+        for (origin, cookie) in validated_cookies {
+            self.jar.add_cookie_str(&cookie, &origin);
+        }
+        let mut client = Client::with_password_payer(transport, self.payer);
+        client.attempts = store;
+        Ok(client)
     }
 }
 
@@ -128,18 +147,11 @@ mod tests {
     use super::*;
     use reqwest::cookie::CookieStore;
     #[test]
-    fn cookie_headers_preserve_all_values_and_browser_shares_protocol_proxy() {
+    fn cookie_headers_preserve_all_values_without_implicit_storage() {
         let jar = Arc::new(CookieJar::default());
-        let dir = tempfile::tempdir().unwrap();
         let client = Client::builder()
             .cookie_jar(jar.clone())
             .cookie_header("https://cashier.cc-pay.cn", "first=one; second=two==")
-            .proxy("socks5://user:pass@10.0.0.2:1080")
-            .alipay_browser(BrowserPayer {
-                proxy: Some("http://wrong.invalid:80".into()),
-                ..Default::default()
-            })
-            .state_directory(dir.path())
             .build()
             .unwrap();
         let cookies = jar
@@ -147,10 +159,7 @@ mod tests {
             .unwrap();
         let cookies = cookies.to_str().unwrap();
         assert!(cookies.contains("first=one") && cookies.contains("second=two=="));
-        assert_eq!(
-            client.password_payer.unwrap().proxy.as_deref(),
-            Some("socks5://user:pass@10.0.0.2:1080")
-        );
+        assert!(client.attempts.is_none());
     }
     #[test]
     fn invalid_cookie_and_unapproved_origins_fail_before_state_creation() {
@@ -166,5 +175,42 @@ mod tests {
                     .is_err()
             );
         }
+    }
+    #[test]
+    fn failed_build_does_not_partially_mutate_shared_cookie_jar() {
+        let jar = Arc::new(CookieJar::default());
+        let origin = url::Url::parse("https://cashier.cc-pay.cn").unwrap();
+        assert!(
+            Client::builder()
+                .cookie_jar(jar.clone())
+                .cookie_header(origin.as_str(), "valid=one; invalid")
+                .build()
+                .is_err()
+        );
+        assert!(jar.cookies(&origin).is_none());
+    }
+    #[test]
+    fn explicit_storage_selection_uses_the_last_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let unused = dir.path().join("unused");
+        let memory: Arc<dyn AttemptStore> = Arc::new(crate::MemoryAttemptStore::default());
+        let client = Client::builder()
+            .state_directory(&unused)
+            .attempt_store(memory.clone())
+            .build()
+            .unwrap();
+        assert!(!unused.exists());
+        assert!(Arc::ptr_eq(client.attempts.as_ref().unwrap(), &memory));
+        let durable = dir.path().join("claims");
+        let client = Client::builder()
+            .attempt_store(memory)
+            .state_directory(&durable)
+            .build()
+            .unwrap();
+        client
+            .claim_attempt("https://cashier.cc-pay.cn/cashier?id=T")
+            .unwrap();
+        let reopened = FileAttemptStore::new(durable).unwrap();
+        assert!(reopened.contains("T").unwrap());
     }
 }

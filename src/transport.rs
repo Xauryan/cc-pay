@@ -18,7 +18,7 @@ impl Response {
         serde_json::from_str(&self.body).context("校园付未返回有效 JSON")
     }
 }
-/// Implementations must share cookies, disable automatic retries/redirects, bound
+/// Implementations must share cookies, disable automatic retries/redirects, validate destinations, bound
 /// response bodies, and never log secrets or replay `/transaction/pay` on failure.
 pub trait Transport: Send + Sync {
     fn request(
@@ -76,12 +76,12 @@ impl HttpTransport {
     ) -> Result<Self> {
         let mut sso_hosts = Vec::new();
         for origin in sso_origins {
-            sso_hosts.push(
-                https_url(origin)?
-                    .host_str()
-                    .context("SSO 域名无效")?
-                    .to_owned(),
+            let origin = https_url(origin)?;
+            ensure!(
+                origin.path() == "/" && origin.query().is_none() && origin.fragment().is_none(),
+                "SSO 地址必须是 origin"
             );
+            sso_hosts.push(origin.host_str().context("SSO 域名无效")?.to_owned());
         }
         ensure!(
             !user_agent.is_empty() && !user_agent.contains(['\r', '\n']),
@@ -99,7 +99,10 @@ impl HttpTransport {
             let u = Url::parse(proxy).map_err(|_| anyhow!("代理地址无效"))?;
             ensure!(
                 ["http", "https", "socks5", "socks5h"].contains(&u.scheme())
-                    && u.host_str().is_some(),
+                    && u.host_str().is_some()
+                    && matches!(u.path(), "" | "/")
+                    && u.query().is_none()
+                    && u.fragment().is_none(),
                 "代理仅支持 HTTP(S)/SOCKS5(H)"
             );
             b = b.proxy(reqwest::Proxy::all(proxy).map_err(|_| anyhow!("代理地址无效"))?);
@@ -243,4 +246,38 @@ pub(crate) fn input_fields(html: &str) -> Fields {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_proxy_schemes_and_sso_origins_are_validated() {
+        for proxy in [
+            "http://127.0.0.1:8080",
+            "https://user:pass@proxy.example:443",
+            "socks5://user:pass@10.0.0.2:1080",
+            "socks5h://10.0.0.2:1080",
+        ] {
+            assert!(HttpTransport::new(Arc::new(Jar::default()), Some(proxy), "test", &[]).is_ok());
+        }
+        for proxy in [
+            "http://proxy.example/path",
+            "socks5://proxy.example?token=secret",
+            "file:///tmp/proxy",
+            "https://proxy.example/#fragment",
+        ] {
+            assert!(
+                HttpTransport::new(Arc::new(Jar::default()), Some(proxy), "test", &[]).is_err()
+            );
+        }
+        for origin in [
+            "https://sso.example/path",
+            "https://sso.example/?q=1",
+            "http://sso.example",
+            "https://sso.example:8443",
+        ] {
+            assert!(HttpTransport::new(Arc::new(Jar::default()), None, "test", &[origin]).is_err());
+        }
+    }
 }
