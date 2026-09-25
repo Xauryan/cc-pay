@@ -1,4 +1,4 @@
-//! Runtime-independent automatic payment outcomes, reasons and submission state.
+//! Runtime-independent automatic payment results. No worker wire protocol.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordOutcome {

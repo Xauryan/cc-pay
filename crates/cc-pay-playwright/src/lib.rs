@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 /// Uses a browser owned and configured by the host application. Each payment has
 /// a fresh non-persistent context. Clones share the same concurrency limit.
-/// The host owns driver provisioning, browser startup and browser shutdown.
+/// This adapter never starts a driver, installs a browser, or closes the browser.
 #[derive(Clone)]
 pub struct PlaywrightPayer {
     browser: Browser,

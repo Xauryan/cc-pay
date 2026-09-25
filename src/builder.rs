@@ -74,7 +74,7 @@ impl<P: PasswordPayer> ClientBuilder<P> {
             store: self.store,
         }
     }
-    /// Store durable payment claims in the supplied application-owned directory.
+    /// Explicit opt-in to durable local storage. Reuse existing claims on migration.
     pub fn state_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.state_directory = Some(directory.into());
         self.store = None;
