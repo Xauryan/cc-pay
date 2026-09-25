@@ -1,5 +1,4 @@
 /target/
-/payment-worker/node_modules/
 .env
 .env.*
 .cc-pay/

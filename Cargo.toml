@@ -1,17 +1,22 @@
 [package]
 name = "cc-pay"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "CC-Pay campus cashier API: WeChat, Alipay and e-CNY wallet payments"
 readme = "README.md"
 repository = "https://github.com/Xauryan/cc-pay"
 keywords = ["payment", "wechat", "alipay", "ecny", "api"]
 categories = ["api-bindings", "web-programming::http-client"]
-include = ["/src/**", "/payment-worker/worker.ts", "/payment-worker/package.json", "/payment-worker/pnpm-lock.yaml", "/payment-worker/tsconfig.json", "/README.md", "/README.en.md", "/Cargo.toml", "/Cargo.lock"]
+include = ["/src/**", "/tests/**", "/README.md", "/README.en.md", "/Cargo.toml", "/Cargo.lock"]
+
+[workspace]
+members = ["crates/cc-pay-playwright"]
+default-members = ["."]
+resolver = "3"
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+tokio = { version = "1", features = ["time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json", "socks", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -24,9 +29,8 @@ qrcode = { version = "0.14", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 html-escape = "0.2"
 encoding_rs = "0.8"
-zeroize = "1"
-libc = "0.2"
 sha2 = "0.10"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"

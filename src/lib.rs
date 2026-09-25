@@ -1,16 +1,16 @@
 #![doc = include_str!("../README.md")]
 mod attempts;
-mod browser;
 mod builder;
 mod model;
+mod password;
 mod payment;
 pub mod transport;
 
 use anyhow::{Result, ensure};
 pub use attempts::{AttemptStore, FileAttemptStore, MemoryAttemptStore};
-pub use browser::{BrowserPayer, BrowserResult};
 pub use builder::{ClientBuilder, PaymentClient};
 pub use model::{AutomaticPayment, Payment};
+pub use password::{PasswordOutcome, PasswordPayment, PasswordReason};
 pub use payment::{cashier_id, parse_post_form, png, valid_wallet_preference};
 pub use reqwest::cookie::Jar as CookieJar;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,8 @@ pub struct PaymentOptions<'a> {
     pub expected_amount: Option<&'a str>,
 }
 
+/// Implement an automatic payer without coupling the core to a browser runtime.
+/// A returned uncertain result must never be retried or converted to QR payment.
 pub trait PasswordPayer: Send + Sync {
     fn pay(
         &self,
@@ -68,13 +70,25 @@ pub trait PasswordPayer: Send + Sync {
         fields: &Fields,
         amount: &str,
         credentials: AlipayCredentials<'_>,
-    ) -> impl Future<Output = BrowserResult> + Send;
+    ) -> impl Future<Output = PasswordPayment> + Send;
 }
 #[derive(Clone, Default)]
 pub struct NoPasswordPayer;
 impl PasswordPayer for NoPasswordPayer {
-    async fn pay(&self, _: &str, _: &Fields, _: &str, _: AlipayCredentials<'_>) -> BrowserResult {
-        BrowserResult::unavailable("browser_unavailable")
+    async fn pay(&self, _: &str, _: &Fields, _: &str, _: AlipayCredentials<'_>) -> PasswordPayment {
+        PasswordPayment::not_submitted(PasswordReason::Unavailable)
+    }
+}
+
+impl<P: PasswordPayer> PasswordPayer for Arc<P> {
+    async fn pay(
+        &self,
+        action: &str,
+        fields: &Fields,
+        amount: &str,
+        credentials: AlipayCredentials<'_>,
+    ) -> PasswordPayment {
+        self.as_ref().pay(action, fields, amount, credentials).await
     }
 }
 impl<P: PasswordPayer> PasswordPayer for Option<P> {
@@ -84,10 +98,10 @@ impl<P: PasswordPayer> PasswordPayer for Option<P> {
         fields: &Fields,
         amount: &str,
         credentials: AlipayCredentials<'_>,
-    ) -> BrowserResult {
+    ) -> PasswordPayment {
         match self {
             Some(payer) => payer.pay(action, fields, amount, credentials).await,
-            None => BrowserResult::unavailable("browser_unavailable"),
+            None => PasswordPayment::not_submitted(PasswordReason::Unavailable),
         }
     }
 }
@@ -96,7 +110,7 @@ impl<P: PasswordPayer> PasswordPayer for Option<P> {
 pub struct Client<T = HttpTransport, P = NoPasswordPayer> {
     transport: T,
     password_payer: P,
-    attempts: Arc<dyn AttemptStore>,
+    attempts: Option<Arc<dyn AttemptStore>>,
 }
 impl<T: Transport> Client<T> {
     pub fn new(transport: T) -> Self {
@@ -108,18 +122,21 @@ impl<T: Transport, P: PasswordPayer> Client<T, P> {
         Self {
             transport,
             password_payer,
-            attempts: Arc::new(MemoryAttemptStore::default()),
+            attempts: None,
         }
     }
     /// Override the attempt store before making any payment calls. Do not replace
     /// a store after use: previously recorded attempts must remain protected.
     pub fn with_attempt_store(mut self, store: Arc<dyn AttemptStore>) -> Self {
-        self.attempts = store;
+        self.attempts = Some(store);
         self
     }
     fn claim_attempt(&self, cashier: &str) -> Result<()> {
         ensure!(
-            self.attempts.claim(&cashier_id(cashier)?)?,
+            self.attempts
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("自动付款必须显式配置 AttemptStore"))?
+                .claim(&cashier_id(cashier)?)?,
             "该订单已有自动付款尝试，请仅查询付款状态"
         );
         Ok(())
